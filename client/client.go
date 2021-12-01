@@ -49,7 +49,7 @@ func WithLogVerbosity(req *SetLogVerbosityLevelRequest) Option {
 	}
 }
 
-func NewClient(authorizationStateHandler AuthorizationStateHandler, options ...Option) (*Client, error) {
+func NewClient(options ...Option) (*Client, error) {
 	catchersListener := make(chan *Response, 1000)
 
 	client := &Client{
@@ -70,18 +70,19 @@ func NewClient(authorizationStateHandler AuthorizationStateHandler, options ...O
 	go receive(client)
 	go client.catch(catchersListener)
 
-	err := Authorize(client, authorizationStateHandler)
-	if err != nil {
-		return nil, err
-	}
-
 	return client, nil
 }
 
+func (client *Client) Auth(ctx context.Context, authHandler AuthorizationStateHandler) error {
+	return Authorize(ctx, client, authHandler)
+}
+
+var mutex = sync.RWMutex{}
 var receiveStarted = false
 var clients = make(map[int]*Client)
 
 func receive(client *Client) {
+	mutex.Lock()
 	_, ok := clients[client.jsonClient.id]
 	if !ok {
 		clients[client.jsonClient.id] = client
@@ -91,26 +92,32 @@ func receive(client *Client) {
 		return
 	}
 	receiveStarted = true
+	mutex.Unlock()
 	for {
 		resp, err := Receive(client.updatesTimeout)
 		if err != nil {
 			continue
 		}
 		receivedClientId := resp.ClientId
+		mutex.RLock()
 		_, ok = clients[receivedClientId]
 		if !ok {
+			mutex.RUnlock()
 			continue
 		}
 
-		clients[receivedClientId].catcher <- resp
+		receiverClient := clients[receivedClientId]
 
+		receiverClient.catcher <- resp
+
+		mutex.RUnlock()
 		typ, err := UnmarshalType(resp.Data)
 		if err != nil {
 			continue
 		}
 
 		needGc := false
-		for _, listener := range clients[receivedClientId].listenerStore.Listeners() {
+		for _, listener := range receiverClient.listenerStore.Listeners() {
 			if listener.IsActive() {
 				listener.Updates <- typ
 			} else {
@@ -118,7 +125,7 @@ func receive(client *Client) {
 			}
 		}
 		if needGc {
-			clients[receivedClientId].listenerStore.gc()
+			receiverClient.listenerStore.gc()
 		}
 	}
 }

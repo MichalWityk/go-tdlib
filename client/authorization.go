@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -13,36 +14,48 @@ type AuthorizationStateHandler interface {
 	Close()
 }
 
-func Authorize(client *Client, authorizationStateHandler AuthorizationStateHandler) error {
-	defer authorizationStateHandler.Close()
+func Authorize(ctx context.Context, client *Client, authorizationStateHandler AuthorizationStateHandler) error {
 
-	var authorizationError error
+	done := make(chan struct{})
+	authorizationErrorChan := make(chan error)
+	go func() {
+		defer authorizationStateHandler.Close()
+		var authorizationError error
+		for {
+			state, err := client.GetAuthorizationState()
+			if err != nil {
+				authorizationErrorChan <- err
+				return
+			}
+			if state.AuthorizationStateType() == TypeAuthorizationStateClosed {
+				authorizationErrorChan <- authorizationError
+				return
+			}
+			if state.AuthorizationStateType() == TypeAuthorizationStateReady {
+				// dirty hack for db flush after authorization
+				time.Sleep(1 * time.Second)
+				done <- struct{}{}
+				return
+			}
+			err = authorizationStateHandler.Handle(client, state)
+			if err != nil {
+				authorizationError = err
+				client.Close()
+			}
+		}
+	}()
 
-	for {
-		state, err := client.GetAuthorizationState()
-		if err != nil {
+	select {
+		case <-ctx.Done():
+			return errors.New("init client timeout")
+		case err := <-authorizationErrorChan:
 			return err
-		}
-
-		if state.AuthorizationStateType() == TypeAuthorizationStateClosed {
-			return authorizationError
-		}
-
-		if state.AuthorizationStateType() == TypeAuthorizationStateReady {
-			// dirty hack for db flush after authorization
-			time.Sleep(1 * time.Second)
+		case <-done:
 			return nil
-		}
-
-		err = authorizationStateHandler.Handle(client, state)
-		if err != nil {
-			authorizationError = err
-			client.Close()
-		}
 	}
 }
 
-type clientAuthorizer struct {
+type ClientAuthorizer struct {
 	TdlibParameters chan *TdlibParameters
 	PhoneNumber     chan string
 	Code            chan string
@@ -50,8 +63,8 @@ type clientAuthorizer struct {
 	Password        chan string
 }
 
-func ClientAuthorizer() *clientAuthorizer {
-	return &clientAuthorizer{
+func NewClientAuthorizer() *ClientAuthorizer {
+	return &ClientAuthorizer{
 		TdlibParameters: make(chan *TdlibParameters, 1),
 		PhoneNumber:     make(chan string, 1),
 		Code:            make(chan string, 1),
@@ -60,7 +73,7 @@ func ClientAuthorizer() *clientAuthorizer {
 	}
 }
 
-func (stateHandler *clientAuthorizer) Handle(client *Client, state AuthorizationState) error {
+func (stateHandler *ClientAuthorizer) Handle(client *Client, state AuthorizationState) error {
 	stateHandler.State <- state
 
 	switch state.AuthorizationStateType() {
@@ -116,7 +129,7 @@ func (stateHandler *clientAuthorizer) Handle(client *Client, state Authorization
 	return ErrNotSupportedAuthorizationState
 }
 
-func (stateHandler *clientAuthorizer) Close() {
+func (stateHandler *ClientAuthorizer) Close() {
 	close(stateHandler.TdlibParameters)
 	close(stateHandler.PhoneNumber)
 	close(stateHandler.Code)
@@ -124,7 +137,7 @@ func (stateHandler *clientAuthorizer) Close() {
 	close(stateHandler.Password)
 }
 
-func CliInteractor(clientAuthorizer *clientAuthorizer) {
+func CliInteractor(clientAuthorizer *ClientAuthorizer) {
 	for {
 		select {
 		case state, ok := <-clientAuthorizer.State:
